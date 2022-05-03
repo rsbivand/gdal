@@ -30,6 +30,9 @@ option(OGR_BUILD_OPTIONAL_DRIVERS "Whether to build OGR optional drivers by defa
 # libgdal shared/satic library generation
 option(BUILD_SHARED_LIBS "Set ON to build shared library" ON)
 
+# produce position independent code, default is on when building a shared library
+option(GDAL_OBJECT_LIBRARIES_POSITION_INDEPENDENT_CODE "Set ON to produce -fPIC code" ${BUILD_SHARED_LIBS})
+
 # Option to set preferred C# compiler
 option(CSHARP_MONO "Whether to force the C# compiler to be Mono" OFF)
 
@@ -720,7 +723,8 @@ if (NOT GDAL_ENABLE_MACOSX_FRAMEWORK)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules/GdalFindModulePath.cmake"
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules/DefineFindPackage2.cmake"
       DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/gdal/")
-    foreach(dir IN ITEMS packages thirdparty 3.20 3.16 3.14 3.13 3.12)
+    include(GdalFindModulePath)
+    foreach(dir IN LISTS GDAL_VENDORED_FIND_MODULES_CMAKE_VERSIONS ITEMS packages thirdparty)
       install(
         DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules/${dir}"
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/gdal")
@@ -728,12 +732,17 @@ if (NOT GDAL_ENABLE_MACOSX_FRAMEWORK)
   endif ()
 
   include(CMakePackageConfigHelpers)
+  if(CMAKE_VERSION VERSION_LESS 3.10.1)
+      set(comptatibility_check ExactVersion)
+  else()
+      # SameMinorVersion compatibility are supported CMake > 3.10.1
+      # Our C++ ABI remains stable only among major.minor.XXX patch releases
+      set(comptatibility_check SameMinorVersion)
+  endif()
   write_basic_package_version_file(
     GDALConfigVersion.cmake
     VERSION ${GDAL_VERSION}
-    # SameMinorVersion compatibility are supported CMake > 3.10.1 so use ExactVersion instead. COMPATIBILITY
-    # SameMinorVersion)
-    COMPATIBILITY ExactVersion)
+    COMPATIBILITY ${comptatibility_check})
   install(FILES ${CMAKE_CURRENT_BINARY_DIR}/GDALConfigVersion.cmake DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/gdal/)
   configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/template/GDALConfig.cmake.in
                  ${CMAKE_CURRENT_BINARY_DIR}/GDALConfig.cmake @ONLY)
