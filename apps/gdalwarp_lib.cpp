@@ -303,7 +303,7 @@ static double GetAverageSegmentLength(OGRGeometryH hGeom)
 /* option to determine the source SRS.                                  */
 /************************************************************************/
 
-static CPLString GetSrcDSProjection( GDALDatasetH hDS, char** papszTO )
+static CPLString GetSrcDSProjection( GDALDatasetH hDS, CSLConstList papszTO )
 {
     const char *pszProjection = CSLFetchNameValue( papszTO, "SRC_SRS" );
     if( pszProjection != nullptr || hDS == nullptr )
@@ -314,7 +314,19 @@ static CPLString GetSrcDSProjection( GDALDatasetH hDS, char** papszTO )
     const char *pszMethod = CSLFetchNameValue( papszTO, "METHOD" );
     char** papszMD = nullptr;
     const OGRSpatialReferenceH hSRS = GDALGetSpatialRef( hDS );
-    if( hSRS
+    const char* pszGeolocationDataset = CSLFetchNameValueDef(papszTO,
+        "SRC_GEOLOC_ARRAY", CSLFetchNameValue(papszTO, "GEOLOC_ARRAY"));
+    if( pszGeolocationDataset != nullptr &&
+             (pszMethod == nullptr || EQUAL(pszMethod,"GEOLOC_ARRAY")) )
+    {
+        auto aosMD = GDALCreateGeolocationMetadata( hDS,
+                                                    pszGeolocationDataset,
+                                                    true );
+        pszProjection = aosMD.FetchNameValue("SRS");
+        if( pszProjection )
+            return pszProjection; // return in this scope so that aosMD is still valid
+    }
+    else if( hSRS
         && (pszMethod == nullptr || EQUAL(pszMethod,"GEOTRANSFORM")) )
     {
         char* pszWKT = nullptr;
@@ -2151,7 +2163,10 @@ static void SetupSkipNoSource(int iSrc,
 /*                     AdjustOutputExtentForRPC()                       */
 /************************************************************************/
 
-static void AdjustOutputExtentForRPC( GDALDatasetH hSrcDS,
+/** Returns false if there's no intersection between source extent defined
+ * by RPC and target extent.
+ */
+static bool AdjustOutputExtentForRPC( GDALDatasetH hSrcDS,
                                       GDALDatasetH hDstDS,
                                       GDALTransformerFunc pfnTransformer,
                                       void *hTransformArg,
@@ -2193,6 +2208,13 @@ static void AdjustOutputExtentForRPC( GDALDatasetH hSrcDS,
                     static_cast<int>(std::ceil(dfMaxX)) + nPadding - nWarpDstXOff);
                 nWarpDstYSize = std::min(nWarpDstYSize - nWarpDstYOff,
                     static_cast<int>(std::ceil(dfMaxY)) + nPadding - nWarpDstYOff);
+                if( nWarpDstXSize <= 0 || nWarpDstYSize <= 0 )
+                {
+                    CPLDebug("WARP",
+                             "No intersection between source extent defined "
+                             "by RPC and target extent");
+                    return false;
+                }
                 if( nWarpDstXOff != 0 || nWarpDstYOff != 0 ||
                     nWarpDstXSize != GDALGetRasterXSize( hDstDS ) ||
                     nWarpDstYSize != GDALGetRasterYSize( hDstDS ) )
@@ -2204,6 +2226,7 @@ static void AdjustOutputExtentForRPC( GDALDatasetH hSrcDS,
             }
         }
     }
+    return true;
 }
 
 /************************************************************************/
@@ -2250,7 +2273,7 @@ GDALDatasetH GDALWarpDirect( const char *pszDest, GDALDatasetH hDstDS,
         bool bDstHasVertAxis = false;
         OGRSpatialReference oSRSSrc;
         OGRSpatialReference oSRSDst;
-        
+
         if( MustApplyVerticalShift( pahSrcDS[0], psOptions,
                                     oSRSSrc, oSRSDst,
                                     bSrcHasVertAxis,
@@ -2654,8 +2677,16 @@ GDALDatasetH GDALWarpDirect( const char *pszDest, GDALDatasetH hDstDS,
 
         if( !bVRT )
         {
-            psWO->pfnProgress = Progress::ProgressFunc;
-            psWO->pProgressArg = &oProgress;
+            if( psOptions->pfnProgress == GDALDummyProgress )
+            {
+                psWO->pfnProgress = GDALDummyProgress;
+                psWO->pProgressArg = nullptr;
+            }
+            else
+            {
+                psWO->pfnProgress = Progress::ProgressFunc;
+                psWO->pProgressArg = &oProgress;
+            }
         }
 
         if( psOptions->dfWarpMemoryLimit != 0.0 )
@@ -2729,14 +2760,20 @@ GDALDatasetH GDALWarpDirect( const char *pszDest, GDALDatasetH hDstDS,
         int nWarpDstXSize = GDALGetRasterXSize( hDstDS );
         int nWarpDstYSize = GDALGetRasterYSize( hDstDS );
 
-        AdjustOutputExtentForRPC( hSrcDS,
+        if( !AdjustOutputExtentForRPC( hSrcDS,
                                   hDstDS,
                                   pfnTransformer,
                                   hTransformArg,
                                   psWO,
                                   psOptions,
                                   nWarpDstXOff, nWarpDstYOff,
-                                  nWarpDstXSize, nWarpDstYSize );
+                                  nWarpDstXSize, nWarpDstYSize ) )
+        {
+            GDALDestroyTransformer( hTransformArg );
+            GDALDestroyWarpOptions( psWO );
+            GDALReleaseDataset(hWrkSrcDS);
+            continue;
+        }
 
         /* We need to recreate the transform when operating on an overview */
         if( poSrcOvrDS != nullptr )
@@ -4112,7 +4149,9 @@ TransformCutlineToSource( GDALDatasetH hSrcDS, OGRGeometryH hCutline,
         OSRIsSame(hRasterSRS, hCutlineSRS) &&
         GDALGetGCPCount( hSrcDS ) == 0 &&
         GDALGetMetadata( hSrcDS, "RPC" ) == nullptr &&
-        GDALGetMetadata( hSrcDS, "GEOLOCATION" ) == nullptr )
+        GDALGetMetadata( hSrcDS, "GEOLOCATION" ) == nullptr &&
+        CSLFetchNameValue( papszTO_In, "GEOLOC_ARRAY") == nullptr &&
+        CSLFetchNameValue( papszTO_In, "SRC_GEOLOC_ARRAY") == nullptr )
     {
         char **papszTOTmp = CSLDuplicate( papszTO_In );
         papszTOTmp = CSLSetNameValue(papszTOTmp, "SRC_SRS", nullptr);
